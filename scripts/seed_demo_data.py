@@ -12,7 +12,7 @@ from app.db.repositories import CustomerRepository, SupportTicketRepository
 async def main() -> None:
     async with session_scope() as session:
         c1, _ = await CustomerRepository(session).get_or_create(
-            phone="+919226408823", name="Demo User", preferred_language="Hindi"
+            phone="+919226408832", name="Demo User", preferred_language="Hindi"
         )
         repo = SupportTicketRepository(session)
         ticket_number = await repo.next_ticket_number()
