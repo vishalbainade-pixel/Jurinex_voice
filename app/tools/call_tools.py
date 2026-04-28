@@ -41,9 +41,21 @@ async def end_call(session: AsyncSession, payload: EndCallInput) -> dict[str, An
         output_json={"ended": True},
         success=True,
     )
+
+    # Actually disconnect the Twilio leg if this is a real Twilio call.
+    twilio_dropped = False
+    if call.twilio_call_sid:
+        from app.services.call_service import CallService
+
+        twilio_dropped = CallService.hangup_twilio_call(call.twilio_call_sid)
+
     log_dataflow(
         "tool.end_call",
-        "agent signalled end of call",
-        payload={"reason": payload.reason},
+        f"agent ended call (twilio_dropped={twilio_dropped})",
+        payload={"reason": payload.reason, "call_sid": call.twilio_call_sid},
     )
-    return {"success": True, "message": "Call marked for graceful end."}
+    return {
+        "success": True,
+        "twilio_dropped": twilio_dropped,
+        "message": "Call ended gracefully.",
+    }

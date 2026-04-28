@@ -134,6 +134,55 @@ class CallService:
             **{"from": settings.twilio_phone_number},
         )
 
+    # ------------------------------------------------------------------
+    # Twilio leg termination — used by end_call tool, watchdogs, etc.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def hangup_twilio_call(call_sid: str, twiml: str | None = None) -> bool:
+        """Disconnect the Twilio call leg (synchronous Twilio REST call).
+
+        Returns True on success. Skips DEMO/empty SIDs.
+        If ``twiml`` is provided, that TwiML plays before the hangup.
+        """
+        if not call_sid or call_sid.startswith("DEMO_"):
+            log_dataflow(
+                "twilio.hangup.skipped",
+                f"sid={call_sid!r} not a real Twilio call",
+                level="debug",
+            )
+            return False
+        if not (settings.twilio_account_sid and settings.twilio_auth_token):
+            log_dataflow(
+                "twilio.hangup.skipped",
+                "twilio creds not configured",
+                level="warning",
+            )
+            return False
+
+        try:
+            client = TwilioClient(settings.twilio_account_sid, settings.twilio_auth_token)
+            if twiml:
+                client.calls(call_sid).update(twiml=twiml)
+                log_dataflow(
+                    "twilio.hangup.twiml",
+                    f"replaced TwiML on {call_sid} (will play farewell + hang up)",
+                )
+            else:
+                client.calls(call_sid).update(status="completed")
+                log_dataflow(
+                    "twilio.hangup.completed",
+                    f"sent status=completed to {call_sid}",
+                )
+            return True
+        except TwilioRestException as exc:
+            log_error(
+                "TWILIO HANGUP FAILED",
+                str(exc),
+                {"call_sid": call_sid},
+            )
+            return False
+
     async def _persist_pending_call(
         self,
         payload: OutboundCallRequest,

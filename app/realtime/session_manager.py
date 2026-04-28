@@ -26,8 +26,8 @@ class SessionManager:
         self._sessions: dict[str, CallSession] = {}
         self._lock = asyncio.Lock()
 
-    async def create(self, **kwargs) -> CallSession:
-        sess = CallSession(session_id=uuid.uuid4().hex, **kwargs)
+    async def create(self, *, session_id: str | None = None, **kwargs) -> CallSession:
+        sess = CallSession(session_id=session_id or uuid.uuid4().hex, **kwargs)
         async with self._lock:
             self._sessions[sess.session_id] = sess
         return sess

@@ -14,13 +14,17 @@ from app.db.schemas import (
     EndCallInput,
     EscalateToHumanInput,
     LookupCustomerInput,
+    SearchKnowledgeBaseInput,
+    TransferToHumanInput,
 )
 from app.observability.logger import log_dataflow, log_error
 from app.tools.call_tools import end_call
 from app.tools.case_tools import check_case_status
 from app.tools.customer_tools import lookup_customer
 from app.tools.escalation_tools import escalate_to_human
+from app.tools.kb_tools import search_knowledge_base
 from app.tools.ticket_tools import create_support_ticket
+from app.tools.transfer_tools import transfer_to_human_agent
 
 
 async def dispatch_tool_call(
@@ -61,6 +65,14 @@ async def dispatch_tool_call(
                 args["call_id"] = str(call_id)
             payload = EndCallInput(**args)
             return await end_call(session, payload)
+
+        if tool_name == "search_knowledge_base":
+            payload = SearchKnowledgeBaseInput(**arguments)
+            return await search_knowledge_base(session, payload, call_id=call_id)
+
+        if tool_name == "transfer_to_human_agent":
+            payload = TransferToHumanInput(**arguments)
+            return await transfer_to_human_agent(session, payload, call_id=call_id)
 
         return {"success": False, "message": f"unknown tool: {tool_name}"}
 

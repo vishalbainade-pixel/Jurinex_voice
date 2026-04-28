@@ -57,6 +57,94 @@ class Settings(BaseSettings):
     secret_key: str = "change_this_secret"
     admin_api_key: str = "change_me"
 
+    # Call lifecycle controls (all env-overridable)
+    silence_timeout_seconds: int = 30           # A — caller silence → hang up
+    max_call_duration_seconds: int = 600        # B — hard cap on a call (10 min)
+    auto_hangup_on_gemini_failure: bool = True  # D — drop the line if Gemini dies
+    farewell_grace_seconds: int = 3             # how long to let Preeti's goodbye play
+    technical_failure_message: str = (
+        "We are experiencing a technical issue. Please call back in a few minutes. Goodbye."
+    )
+
+    # Knowledge base (RAG) — read against the shared admin-owned KB tables
+    kb_enabled: bool = True
+    kb_agent_name: str = "preeti"        # voice_agents.name to scope our queries
+    kb_embedding_model: str = "gemini-embedding-001"
+    kb_embedding_dim: int = 768
+    kb_search_k: int = 5
+    kb_min_score: float = 0.60           # below this Preeti must hand off
+    # Shadow-RAG (proactive context injection on every caller turn) uses a
+    # LOWER threshold because the caller's raw transcript is in Hindi/Marathi
+    # while docs are indexed in English — cross-language cosine is naturally
+    # weaker than same-language. Set to 0 to inject the top hit always; raise
+    # to disable shadow injection entirely.
+    kb_shadow_enabled: bool = True
+    kb_shadow_min_score: float = 0.50
+
+    # Human-agent transfer (Twilio Dial bridge)
+    support_admin_phone: str = "+917885820020"
+    # How long Twilio rings the admin before falling back to a polite goodbye.
+    transfer_dial_timeout_seconds: int = 30
+
+    # On-hold message Twilio plays to the caller while the admin's phone rings.
+    # We keep three language variants and pick one based on the caller's
+    # selected language at transfer time. Each ~12-15 seconds of speech.
+    transfer_hold_message_en: str = (
+        "Please stay on the line, I am connecting you to our Jurinex support team. "
+        "While we connect you, here is a quick overview of Jurinex. "
+        "Jurinex is an AI legal intelligence platform built for Indian lawyers. "
+        "It includes a Smart Case Summarizer that condenses lengthy judgements in seconds, "
+        "AI Case Creation that drafts plaints, writs and bail applications from basic facts, "
+        "a real-time Citation Service powered by India Kanoon, "
+        "and an AI Document Drafter for sale deeds, agreements, notices and more. "
+        "A support specialist will be with you shortly. Thank you for your patience."
+    )
+    transfer_hold_message_hi: str = (
+        "कृपया लाइन पर बने रहें, मैं आपको हमारी Jurinex support team से जोड़ रही हूँ। "
+        "जब तक हम आपको जोड़ते हैं, आइए Jurinex के बारे में एक संक्षिप्त परिचय देते हैं। "
+        "Jurinex भारतीय वकीलों के लिए बनाया गया एक AI Legal Intelligence Platform है। "
+        "इसमें Smart Case Summarizer है जो लंबे judgements को सेकंडों में सारांश में बदल देता है, "
+        "AI Case Creation है जो basic facts से plaints, writ petitions और bail applications तैयार करता है, "
+        "India Kanoon से जुड़ी real-time Citation Service है, "
+        "और AI Document Drafter है जो sale deeds, agreements, notices और बहुत कुछ बनाता है। "
+        "एक support specialist बस कुछ ही पलों में आपसे बात करेंगे। आपके धैर्य के लिए धन्यवाद।"
+    )
+    transfer_hold_message_mr: str = (
+        "कृपया लाइनवर थांबा, मी तुम्हाला आमच्या Jurinex support team कडे जोडत आहे. "
+        "जोपर्यंत आम्ही तुम्हाला जोडतो, तोपर्यंत Jurinex बद्दल थोडक्यात माहिती ऐका. "
+        "Jurinex हे भारतीय वकीलांसाठी तयार केलेले AI Legal Intelligence Platform आहे. "
+        "यात Smart Case Summarizer आहे जो लांब judgements काही सेकंदात summary मध्ये बदलतो, "
+        "AI Case Creation आहे जे basic facts वरून plaints, writ petitions आणि bail applications तयार करते, "
+        "India Kanoon शी जोडलेली real-time Citation Service आहे, "
+        "आणि AI Document Drafter आहे जो sale deeds, agreements, notices आणि बरेच काही तयार करतो. "
+        "एक support specialist काही क्षणांत तुमच्याशी बोलणार आहेत. तुमच्या संयमाबद्दल धन्यवाद."
+    )
+
+    # Optional Twilio TTS voice overrides for the hold message (per language).
+    # Examples:
+    #   Google.hi-IN-Neural2-A     ← natural Indian Hindi female (Neural2)
+    #   Google.hi-IN-Wavenet-A     ← Wavenet alternative
+    #   Polly.Aditi-Neural         ← Amazon Polly neural Hindi/English
+    #   Polly.Joanna-Neural        ← Amazon Polly neural English (US)
+    #   alice                      ← Twilio's default basic voice
+    # See https://www.twilio.com/docs/voice/twiml/say/text-speech for the full list.
+    transfer_hold_voice_en: str = "Google.en-IN-Neural2-A"
+    transfer_hold_voice_hi: str = "Google.hi-IN-Neural2-A"
+    transfer_hold_voice_mr: str = "Google.mr-IN-Wavenet-A"
+
+    # GCS recordings — buffer caller + agent audio in memory, upload at call end
+    gcs_recordings_enabled: bool = True
+    gcs_bucket: str = "jurinex-voice"
+    google_application_credentials: str = ""    # path to GCP service-account JSON
+    # Alternative to a JSON file path: paste a base64-encoded service-account key
+    # directly into the env var. Easier for Cloud Run / Docker deployment because
+    # no file mount is needed. ``gcs_key_base64`` wins over the file path if both
+    # are set.
+    gcs_key_base64: str = ""
+    # Optional explicit project override. If set, used as the Storage client's
+    # billing project; otherwise the SA JSON's `project_id` is used.
+    gcs_project_id: str = ""
+
     @property
     def gemini_key(self) -> str:
         """Return whichever Gemini key is configured."""

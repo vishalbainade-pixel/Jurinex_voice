@@ -79,6 +79,17 @@ class EndCallInput(BaseModel):
     reason: str | None = None
 
 
+class SearchKnowledgeBaseInput(BaseModel):
+    query: str
+    k: int = 5
+
+
+class TransferToHumanInput(BaseModel):
+    reason: str = "general_support"
+    farewell: str | None = None  # optional message Preeti wants spoken before transfer
+    language: Literal["English", "Hindi", "Marathi"] = "English"
+
+
 # ---------------------------------------------------------------------------
 # Admin output schemas
 # ---------------------------------------------------------------------------
