@@ -109,6 +109,35 @@ class GeminiLiveClient:
                 level="warning",
             )
 
+        # VAD tuning for telephony.
+        #
+        # We start_sensitivity=LOW (not HIGH) because:
+        #   - μ-law/8k phone audio has line noise + breathing that HIGH
+        #     sensitivity treated as speech → it kept interrupting Preeti
+        #     mid-sentence → Gemini retried the same response → same noise
+        #     interrupted again → "speaks 2 words then restarts" loop.
+        #   - LOW + 200 ms prefix_padding requires real, sustained speech
+        #     before VAD fires the interrupt.
+        # silence_duration=500ms gives the caller a comfortable beat to
+        # finish their thought before Gemini starts responding.
+        try:
+            config_kwargs["realtime_input_config"] = types.RealtimeInputConfig(
+                automatic_activity_detection=types.AutomaticActivityDetection(
+                    disabled=False,
+                    start_of_speech_sensitivity="START_SENSITIVITY_LOW",
+                    end_of_speech_sensitivity="END_SENSITIVITY_HIGH",
+                    prefix_padding_ms=200,
+                    silence_duration_ms=500,
+                ),
+                activity_handling="START_OF_ACTIVITY_INTERRUPTS",
+            )
+        except (AttributeError, ValueError) as exc:
+            log_dataflow(
+                "gemini.vad",
+                f"RealtimeInputConfig not available on this SDK: {exc}",
+                level="warning",
+            )
+
         # Tool declarations the model can call. Wrapped in try/except so an
         # SDK without `Tool` / `FunctionDeclaration` still opens cleanly.
         try:
@@ -471,6 +500,13 @@ class GeminiLiveClient:
         # inline_data / text part in `server_content.model_turn.parts`.
         # Walking the nested path on top would duplicate every chunk.
 
+        # Interruption (caller barged in) — handle first so any in-flight
+        # audio chunks below are dropped, not played.
+        sc = getattr(response, "server_content", None)
+        if sc is not None and getattr(sc, "interrupted", False):
+            self._inbox.put_nowait(GeminiEvent(type="interrupt"))
+            return  # don't process audio/text from this response chunk
+
         data = getattr(response, "data", None)
         if data:
             self._inbox.put_nowait(
@@ -637,7 +673,17 @@ def _build_tool_declarations(types: Any) -> list[Any]:
                     },
                     "farewell": {
                         "type": "string",
-                        "description": "Optional override of the on-hold message. Leave empty unless you need to say something specific to this caller's situation; Twilio will use the configured language-specific message instead.",
+                        "description": (
+                            "Controls the static on-hold message Twilio "
+                            "reads while dialing the admin. PASS \"\" "
+                            "(empty string) when you have already spoken "
+                            "the dynamic pitch in your own voice — this "
+                            "tells Twilio to skip its TTS message entirely "
+                            "and go straight to dialing. Pass a custom "
+                            "string to override with that text. Omit "
+                            "the field to use the configured default "
+                            "language-specific message."
+                        ),
                     },
                 },
                 "required": ["reason", "language"],

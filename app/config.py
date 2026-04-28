@@ -81,6 +81,25 @@ class Settings(BaseSettings):
     kb_shadow_enabled: bool = True
     kb_shadow_min_score: float = 0.50
 
+    # Eager greeting — Twilio plays a pre-rendered Hindi greeting via <Say>
+    # *before* the media stream opens, so the caller hears something within
+    # ~500 ms of pickup (the Gemini Live cold-start would otherwise leave
+    # 4-6 s of dead air). By the time the static greeting finishes, the
+    # Gemini session is open and Preeti can respond to the caller's reply.
+    eager_greeting_enabled: bool = True
+    eager_greeting_text: str = (
+        "नमस्ते, Jurinex support से संपर्क करने के लिए धन्यवाद। "
+        "मैं Preeti बोल रही हूँ। मैं आपकी मदद English, Hindi या Marathi में "
+        "कर सकती हूँ। आप कौन सी भाषा पसंद करेंगे?"
+    )
+    eager_greeting_voice: str = "Google.hi-IN-Neural2-A"
+    eager_greeting_language: str = "hi-IN"
+    # If set, Twilio plays this audio file (WAV/MP3) instead of TTS-reading
+    # `eager_greeting_text`. Lets you ship Preeti's exact voice. Accepts
+    # either a full URL (https://…) or a path relative to the app
+    # (e.g. "/static/greeting.wav") which gets prefixed with PUBLIC_BASE_URL.
+    eager_greeting_audio_url: str = ""
+
     # Human-agent transfer (Twilio Dial bridge)
     support_admin_phone: str = "+917885820020"
     # How long Twilio rings the admin before falling back to a polite goodbye.

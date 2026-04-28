@@ -60,6 +60,12 @@ class TwilioMediaStreamHandler:
         # know the call_sid + start time.
         self.recorder: CallRecorder | None = None
 
+        # True while the static greeting WAV is being streamed to Twilio.
+        # During this window we do NOT forward caller audio to Gemini —
+        # otherwise if the caller says anything ("hello", etc.), Gemini
+        # generates a response that overlaps with the greeting playback.
+        self._greeting_playing: bool = False
+
         # Shadow-RAG state. The Live model can't be relied on to call
         # search_knowledge_base itself, so we run KB search on every
         # caller utterance and inject top chunks back into Gemini's context.
@@ -124,6 +130,7 @@ class TwilioMediaStreamHandler:
         import uuid as _uuid
 
         from app.realtime.gemini_live_client import GeminiLiveClient as _GeminiLiveClient
+        from app.realtime.greeting_loader import get_greeting_mulaw
 
         start = evt.get("start", {})
         self.stream_sid = start.get("streamSid")
@@ -136,6 +143,34 @@ class TwilioMediaStreamHandler:
 
         update_trace(call_sid=self.call_sid, direction=direction.value)
 
+        # Decide once whether we're going to pre-play the greeting WAV. This
+        # changes both the system prompt (suppress Turn 1) AND whether we
+        # prime Gemini to speak first (we don't, when greeting is pre-played).
+        greeting_mulaw = (
+            get_greeting_mulaw() if settings.eager_greeting_enabled else None
+        )
+        greeting_will_play = greeting_mulaw is not None
+
+        if greeting_will_play:
+            # Append a runtime override that forbids Preeti from generating
+            # her own greeting — the static WAV is handling Turn 1 entirely.
+            sys_prompt = JURINEX_PREETI_SYSTEM_PROMPT + (
+                "\n\n=== RUNTIME OVERRIDE FOR THIS CALL ===\n"
+                "A pre-recorded Hindi greeting is being played to the caller "
+                "RIGHT NOW by another channel. It introduces you as Preeti "
+                "and asks the caller to choose a language. So:\n"
+                "- DO NOT speak Turn 1. SKIP IT ENTIRELY.\n"
+                "- DO NOT say 'नमस्ते', 'Hello', 'Jurinex support', or "
+                "'मैं Preeti बोल रही हूँ'. The caller is already hearing this.\n"
+                "- Stay completely silent until the caller speaks to you.\n"
+                "- Your FIRST utterance must be Turn 2 — a brief acknowledgement "
+                "  of the caller's language pick and 'how can I help?'.\n"
+                "Speaking the greeting now will create double audio overlapping "
+                "with the recorded greeting. This is forbidden.\n"
+            )
+        else:
+            sys_prompt = JURINEX_PREETI_SYSTEM_PROMPT
+
         # ── Pre-warm: open the Gemini Live WS in parallel with the DB writes.
         # Cold-start network handshake is the slowest part of "first speak"
         # latency; running it concurrently shaves ~200-400 ms.
@@ -143,7 +178,7 @@ class TwilioMediaStreamHandler:
         gemini = _GeminiLiveClient()
         gemini.on_session_dead = self._on_gemini_session_dead
         connect_task = asyncio.create_task(
-            gemini.connect(pre_session_id, JURINEX_PREETI_SYSTEM_PROMPT)
+            gemini.connect(pre_session_id, sys_prompt)
         )
 
         async with session_scope() as session:
@@ -198,6 +233,21 @@ class TwilioMediaStreamHandler:
                 f"recording → gs://{settings.gcs_bucket}/{self.recorder.gcs_folder()}/",
             )
 
+        # Stream the pre-loaded greeting WAV back to Twilio NOW, in parallel
+        # with the Gemini connect. By the time the greeting finishes (~10 s),
+        # the Live session is fully warm and Preeti can respond instantly.
+        # `greeting_will_play` was decided up top so the system prompt could
+        # also be patched to suppress Gemini's own greeting (avoids overlap).
+        if greeting_will_play:
+            from app.realtime.greeting_loader import get_greeting_duration
+
+            asyncio.create_task(self._play_greeting_via_stream(greeting_mulaw))
+            log_dataflow(
+                "greeting.play.scheduled",
+                f"streaming {len(greeting_mulaw)}b μ-law "
+                f"({get_greeting_duration():.2f}s) via Twilio WS",
+            )
+
         # Wait for the pre-warmed Gemini handshake to finish (often already done).
         await connect_task
         self._gemini_task = asyncio.create_task(self._consume_gemini_events())
@@ -214,16 +264,23 @@ class TwilioMediaStreamHandler:
             f"auto_hangup_on_gemini_failure={settings.auto_hangup_on_gemini_failure}",
         )
 
-        # Make Preeti speak first. We use `send_realtime_input(text=...)`
-        # (a different code path from send_client_content — doesn't trigger
-        # WS close 1008 on an audio-modality session). If the SDK rejects it,
-        # the call still proceeds; Preeti will just wait for caller audio.
-        await self.session.gemini.prime(
-            "[The phone call has just been answered. Speak ONLY the Hindi "
-            "opening greeting now and ask which language the caller would "
-            "prefer (English, Hindi, or Marathi). Do NOT recite the English "
-            "or Marathi versions of the greeting at this point.]"
-        )
+        # Make Preeti speak first ONLY when we are NOT pre-playing a greeting.
+        # When the static WAV is being streamed, priming Gemini would cause
+        # her to generate her own greeting in parallel → echo / double audio.
+        # In that case we leave Gemini silent; she'll speak when the caller
+        # responds to the recorded greeting.
+        if not greeting_will_play:
+            await self.session.gemini.prime(
+                "[The phone call has just been answered. Speak ONLY the Hindi "
+                "opening greeting now and ask which language the caller would "
+                "prefer (English, Hindi, or Marathi). Do NOT recite the English "
+                "or Marathi versions of the greeting at this point.]"
+            )
+        else:
+            log_dataflow(
+                "gemini.prime.skipped",
+                "eager greeting is being streamed — Gemini stays silent until caller speaks",
+            )
 
     # Above this PCM16 RMS we consider the caller to be speaking. Twilio
     # sends μ-law frames continuously, so we can't gate on "frame received";
@@ -252,6 +309,14 @@ class TwilioMediaStreamHandler:
                 self._last_mic_activity_ts = time.monotonic()
         except Exception:
             self._last_mic_activity_ts = time.monotonic()
+
+        # While the greeting WAV is still streaming to the caller, suppress
+        # forwarding to Gemini. Otherwise a caller "hello" mid-greeting would
+        # trigger a Gemini reply that overlaps with the greeting playback.
+        # Audio is still recorded + counted by the silence watchdog above.
+        if self._greeting_playing:
+            self._mic_buffer.clear()  # don't accumulate stale frames
+            return
 
         self._mic_buffer.extend(pcm16_16k)
 
@@ -330,8 +395,88 @@ class TwilioMediaStreamHandler:
                     await self._send_audio_back_to_twilio(encode_twilio_payload(frame))
         elif event.type == "tool_call":
             await self._handle_tool_call(event)
+        elif event.type == "interrupt":
+            await self._handle_interrupt()
         elif event.type == "error":
             log_error("GEMINI ERROR", event.error or "unknown")
+
+    async def _play_greeting_via_stream(self, mulaw_audio: bytes) -> None:
+        """Stream the cached greeting μ-law buffer to Twilio in 20ms frames.
+
+        Paced at 20ms per frame so Twilio doesn't drop frames from a too-fast
+        burst. This runs in parallel with the Gemini connect, so by the time
+        the caller hears the end of the greeting, Preeti is fully ready.
+        """
+        if not self.stream_sid:
+            return
+        from app.realtime.audio_codec import (
+            TWILIO_FRAME_BYTES,
+            chunk_mulaw_for_twilio,
+            encode_twilio_payload,
+        )
+
+        frames = chunk_mulaw_for_twilio(mulaw_audio)
+        log_dataflow(
+            "greeting.play.start", f"frames={len(frames)} (20ms each)"
+        )
+        # Pace ~20ms per frame so we don't blast Twilio's buffer.
+        # Slightly under 20 to account for send overhead.
+        FRAME_INTERVAL = 0.018
+        self._greeting_playing = True
+        try:
+            for i, frame in enumerate(frames):
+                if not self.stream_sid:
+                    break  # call torn down
+                payload = encode_twilio_payload(frame)
+                try:
+                    await self.websocket.send_text(
+                        json.dumps(
+                            {
+                                "event": "media",
+                                "streamSid": self.stream_sid,
+                                "media": {"payload": payload},
+                            }
+                        )
+                    )
+                except Exception as exc:
+                    log_dataflow(
+                        "greeting.play.send_error",
+                        str(exc),
+                        level="warning",
+                    )
+                    return
+                await asyncio.sleep(FRAME_INTERVAL)
+            log_dataflow("greeting.play.done", f"streamed {len(frames)} frames")
+        except asyncio.CancelledError:
+            raise
+        finally:
+            # Greeting finished (or errored) — caller audio can now flow to Gemini.
+            self._greeting_playing = False
+            log_dataflow(
+                "greeting.play.flag_cleared",
+                "caller mic now forwarded to Gemini",
+            )
+
+    async def _handle_interrupt(self) -> None:
+        """Caller barged in. Flush Twilio's playback buffer so we don't keep
+        speaking over them, and reset the audio resampler state."""
+        log_dataflow("twilio.media.interrupt", "caller barged in — flushing playback")
+        # Send Twilio a `clear` event — discards any media we already pushed
+        # but Twilio hasn't played yet. Without this the caller hears Preeti
+        # finish her previous sentence before going silent.
+        if self.stream_sid:
+            try:
+                await self.websocket.send_text(
+                    json.dumps(
+                        {"event": "clear", "streamSid": self.stream_sid}
+                    )
+                )
+            except Exception as exc:
+                log_dataflow(
+                    "twilio.media.clear_error", str(exc), level="warning"
+                )
+        # Reset the 24k→8k resampler so the next response doesn't start mid-sample.
+        self._out_resampler = Pcm24kToMulaw8k()
 
     # ------------------------------------------------------------------
     # Shadow RAG — proactively feed KB chunks into Gemini's context

@@ -12,6 +12,7 @@ EventType = Literal[
     "input_transcript",   # caller's speech transcribed by Gemini
     "output_transcript",  # agent's spoken reply transcribed by Gemini
     "tool_call",
+    "interrupt",          # caller barged in — flush pending agent audio
     "session_close",
     "error",
 ]

@@ -60,10 +60,19 @@ def _build_transfer_twiml(*, farewell: str | None, language: str) -> str:
 
     voice = _voice_for(language)
     lang_code = _LANGUAGE_CODE_MAP.get(language, "en-IN")
-    # The model can override with its own farewell; otherwise use the
-    # configurable language-specific Jurinex pitch so the caller doesn't
-    # hear silence while the admin's phone rings.
-    hold_text = farewell or _hold_message_for(language)
+    # `farewell` semantics:
+    #   None      → use the configured language-specific static pitch
+    #               (Twilio Polly/Google reads it before <Dial>)
+    #   ""        → SUPPRESS the static <Say> entirely. Use this when
+    #               Preeti has already spoken a dynamic pitch in her own
+    #               voice before calling the tool, so Twilio doesn't read
+    #               a duplicate over the top.
+    #   "custom"  → speak this exact text instead of the default.
+    if farewell is None:
+        hold_text = _hold_message_for(language)
+    else:
+        hold_text = farewell
+
     say_xml = (
         f'<Say voice="{html.escape(voice)}" language="{lang_code}">'
         f"{html.escape(hold_text)}</Say>"

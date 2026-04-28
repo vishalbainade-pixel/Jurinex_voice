@@ -41,9 +41,41 @@ def _build_twiml_stream(
     safe_to = xml_escape(to_number or "")
     safe_sid = xml_escape(call_sid or "")
 
+    # Eager greeting — three flavours, picked automatically:
+    #
+    #   1. PRE-LOADED LOCAL WAV (fastest):
+    #      If the greeting WAV was successfully loaded at app startup, we
+    #      do NOT add <Play> here. The Stream handler streams the cached
+    #      μ-law bytes directly through the WS as soon as Stream opens,
+    #      so Gemini Live cold-start can happen in parallel with the
+    #      greeting playback. Total post-greeting latency: near zero.
+    #
+    #   2. <Play> a remote URL or local file we couldn't pre-load:
+    #      Sequential — Twilio plays the file, then opens Connect/Stream.
+    #      The Gemini cold-start happens AFTER the playback ends.
+    #
+    #   3. <Say> with TTS — fallback when no audio is configured.
+    eager_say = ""
+    if settings.eager_greeting_enabled:
+        from app.realtime.greeting_loader import get_greeting_mulaw
+
+        if get_greeting_mulaw() is None:
+            audio_url = settings.eager_greeting_audio_url.strip()
+            if audio_url:
+                if not audio_url.lower().startswith(("http://", "https://")):
+                    audio_url = f"{base}/{audio_url.lstrip('/')}"
+                eager_say = f"  <Play>{xml_escape(audio_url)}</Play>\n"
+            elif settings.eager_greeting_text:
+                eg_text = xml_escape(settings.eager_greeting_text)
+                eg_voice = xml_escape(settings.eager_greeting_voice)
+                eg_lang = xml_escape(settings.eager_greeting_language)
+                eager_say = (
+                    f'  <Say voice="{eg_voice}" language="{eg_lang}">{eg_text}</Say>\n'
+                )
+
     return f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Connect>
+{eager_say}  <Connect>
     <Stream url="{ws_url}">
       <Parameter name="direction" value="{safe_direction}"/>
       <Parameter name="from" value="{safe_from}"/>
