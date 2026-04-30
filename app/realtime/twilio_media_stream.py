@@ -76,6 +76,12 @@ class TwilioMediaStreamHandler:
         # for a window so we don't double-search on a partial transcript.
         self._tool_called_at: float = 0.0
         self._tool_quiet_window_seconds: float = 5.0
+        # Last time we saw an output_transcript fragment from Gemini. While
+        # this is recent, the model is actively speaking — injecting a
+        # shadow-RAG prime now would restart its turn ("speaks 3 words then
+        # restarts from word 1" pattern, especially during the transfer pitch).
+        self._last_output_transcript_at: float = 0.0
+        self._model_speaking_quiet_window_seconds: float = 1.5
 
     # ------------------------------------------------------------------
     # Top-level handler
@@ -377,6 +383,9 @@ class TwilioMediaStreamHandler:
         elif event.type == "output_transcript":
             text = event.text or ""
             log_dataflow("gemini.transcript.output", text[:160])
+            # Mark that the model is currently speaking — used by shadow-RAG
+            # to avoid injecting a prime() mid-turn (which would restart it).
+            self._last_output_transcript_at = time.monotonic()
             async with session_scope() as session:
                 await TranscriptService(session).save_message(
                     call_id=self.session.call_db_id,
@@ -501,7 +510,8 @@ class TwilioMediaStreamHandler:
             return
         # Stand down if the model just ran its own search — no need to
         # double-search and re-inject on a partial transcript fragment.
-        since_tool = time.monotonic() - self._tool_called_at
+        now = time.monotonic()
+        since_tool = now - self._tool_called_at
         if self._tool_called_at and since_tool < self._tool_quiet_window_seconds:
             log_dataflow(
                 "kb.shadow.skipped",
@@ -509,6 +519,23 @@ class TwilioMediaStreamHandler:
                 level="debug",
             )
             self._caller_transcript_buf = ""  # reset so we don't accumulate stale text
+            return
+        # Stand down if the model is currently speaking. Sending a prime()
+        # while it's mid-turn would restart the turn (caller hears: "मैं आपको
+        # connect कर..." → kill → "मैं आपको connect कर..." → kill → loop).
+        # This is most visible during the long transfer pitch.
+        since_speech = now - self._last_output_transcript_at
+        if (
+            self._last_output_transcript_at
+            and since_speech < self._model_speaking_quiet_window_seconds
+        ):
+            log_dataflow(
+                "kb.shadow.skipped",
+                f"model is currently speaking ({since_speech:.2f}s since last "
+                f"transcript) — standing down so we don't restart the turn",
+                level="debug",
+            )
+            self._caller_transcript_buf = ""
             return
         query = self._caller_transcript_buf.strip()
         # Skip very short / trivial replies — saves embedding cost and avoids
