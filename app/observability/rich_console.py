@@ -62,3 +62,43 @@ def render_error_panel(title: str, message: str, fields: Mapping[str, Any] | Non
     for key, value in (fields or {}).items():
         body.add_row(str(key), str(value))
     console.print(Panel(body, title=f"❌ {title}", border_style="red", expand=False))
+
+
+def render_db_row_table(
+    *,
+    table_name: str,
+    operation: str,
+    columns: Mapping[str, Any],
+    style: str = "blue",
+    icon_key: str | None = "db",
+) -> None:
+    """Render a single DB row as a 2-column ``column / value`` Rich table.
+
+    Used by the repository writers (e.g. voice_calendar_bookings) to make
+    the persisted row visible in the console dataflow without having to
+    open psql. Long values get truncated to ~120 chars to keep the
+    terminal readable.
+    """
+    icon = _ICONS.get(icon_key or "", "🗄️")
+    title = f"{icon} {operation} → {table_name}"
+
+    table = Table(
+        show_header=True,
+        header_style="bold " + style,
+        border_style=style,
+        expand=False,
+    )
+    table.add_column("column", style="bold")
+    table.add_column("value")
+
+    for col, val in columns.items():
+        if val is None:
+            rendered = "[dim]NULL[/dim]"
+        else:
+            text = str(val)
+            if len(text) > 120:
+                text = text[:117] + "…"
+            rendered = text
+        table.add_row(str(col), rendered)
+
+    console.print(Panel(table, title=title, border_style=style, expand=False))

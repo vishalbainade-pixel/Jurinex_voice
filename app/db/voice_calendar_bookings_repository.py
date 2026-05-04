@@ -34,7 +34,7 @@ from typing import Any
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.observability.logger import log_dataflow
+from app.observability.logger import log_db_row, log_dataflow
 
 
 class VoiceCalendarBookingsRepository:
@@ -104,5 +104,32 @@ class VoiceCalendarBookingsRepository:
             f"id={booking_id} status={status} "
             f"google_event_id={google_event_id} "
             f"calendar={google_calendar_id}",
+        )
+
+        # Render the persisted row as a Rich table so the operator can see
+        # exactly what landed in voice_calendar_bookings without opening psql.
+        # Status drives the panel colour: green for booked, red for failed.
+        log_db_row(
+            table_name="voice_calendar_bookings",
+            operation=f"INSERT (status={status})",
+            columns={
+                "id": booking_id,
+                "session_id": session_id,
+                "agent_id": agent_id,
+                "tool_execution_id": tool_execution_id,
+                "google_event_id": google_event_id,
+                "google_calendar_id": google_calendar_id,
+                "summary": summary,
+                "start_time": start_time.isoformat() if start_time else None,
+                "end_time": end_time.isoformat() if end_time else None,
+                "attendee_name": attendee_name,
+                "attendee_email": attendee_email,
+                "attendee_phone": attendee_phone,
+                "status": status,
+                "metadata": metadata,
+                "description": description,
+            },
+            style=("green" if status == "booked" else "red"),
+            icon_key="tool" if status == "booked" else "error",
         )
         return booking_id

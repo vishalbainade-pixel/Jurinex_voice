@@ -11,6 +11,7 @@ from rich.logging import RichHandler
 from app.config import settings
 from app.observability.rich_console import (
     console,
+    render_db_row_table,
     render_event_panel,
     render_error_panel,
 )
@@ -192,6 +193,30 @@ def log_event_panel(
     icon_key: str | None = None,
 ) -> None:
     render_event_panel(title, fields, style=style, icon_key=icon_key)
+
+
+def log_db_row(
+    *,
+    table_name: str,
+    operation: str,
+    columns: dict[str, Any],
+    style: str = "blue",
+    icon_key: str | None = "db",
+) -> None:
+    """Render a persisted DB row as a labelled table in the console.
+
+    Use this from repository writers when you want the actual row contents
+    visible alongside the dataflow logs. The repository continues to emit
+    its own `*.persisted` dataflow line as well — this is purely the human-
+    readable companion for terminal observation.
+    """
+    render_db_row_table(
+        table_name=table_name,
+        operation=operation,
+        columns=columns,
+        style=style,
+        icon_key=icon_key,
+    )
 
 
 def log_error(title: str, message: str, fields: dict[str, Any] | None = None) -> None:

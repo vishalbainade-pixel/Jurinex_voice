@@ -987,37 +987,80 @@ def _build_tool_declarations(
         types.FunctionDeclaration(
             name="calendar_book",
             description=(
-                "Create a Google Calendar event after the caller has agreed "
-                "to a specific slot AND spelled out their email. Returns "
-                "status='booked' with google_event_id on success, or one of "
-                "{outside_working_hours, date_blocked, day_disabled, "
-                "view_only, conflict} on failure. Always read back the date, "
-                "time, reason, and email aloud BEFORE calling this tool."
+                "Create a Google Calendar event for a demo / meeting. "
+                "Always call this tool when the caller agrees to a slot — "
+                "speaking 'I have booked you' WITHOUT calling this tool is a "
+                "hard violation; the booking will not exist on the calendar.\n\n"
+                "BEFORE calling: read back date, time, reason, and the email "
+                "aloud and get a 'yes'. Spell back the email — never guess. "
+                "AFTER calling: confirm to the caller ONLY when the tool "
+                "returns status='booked' AND verified_on_calendar=true.\n\n"
+                "On status in {bad_timestamp, outside_working_hours, "
+                "date_blocked, day_disabled, view_only, conflict, "
+                "insert_failed}, do NOT claim the booking succeeded. Apologise "
+                "briefly and either fix the slot (call calendar_check again) "
+                "or fix the timestamp format and re-issue."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "start_iso": {
                         "type": "string",
-                        "description": "Start time in ISO 8601 with TZ offset.",
+                        "description": (
+                            "Start time in ISO 8601 WITH timezone offset, "
+                            "e.g. '2026-05-04T10:00:00+05:30'. A naive "
+                            "timestamp without offset is REJECTED."
+                        ),
                     },
                     "end_iso": {
                         "type": "string",
                         "description": (
-                            "End time in ISO 8601 with TZ offset. If equal to "
-                            "start_iso the bridge fills in default_meeting_minutes."
+                            "End time in ISO 8601 with timezone offset. If "
+                            "equal to start_iso the bridge fills in "
+                            "default_meeting_minutes."
                         ),
                     },
                     "summary": {
                         "type": "string",
-                        "description": "Short event title (the meeting reason).",
+                        "description": (
+                            "Short event title — typically the meeting "
+                            "reason (e.g. 'Jurinex demo with Rohit')."
+                        ),
                     },
-                    "attendee_name": {"type": "string"},
-                    "attendee_email": {"type": "string"},
-                    "attendee_phone": {"type": "string"},
+                    "attendee_name": {
+                        "type": "string",
+                        "description": (
+                            "Full name of the person you are booking the "
+                            "demo for. Capture this from the caller before "
+                            "booking — appears in the calendar event so the "
+                            "human can address them by name."
+                        ),
+                    },
+                    "attendee_email": {
+                        "type": "string",
+                        "description": (
+                            "Caller's email — ASK THE CALLER TO SPELL IT, "
+                            "never guess. Goes into the event description so "
+                            "the human can follow up. Without DWD enabled, "
+                            "no invite email is sent automatically."
+                        ),
+                    },
+                    "attendee_phone": {
+                        "type": "string",
+                        "description": (
+                            "Best phone number to reach the caller on. Goes "
+                            "into the event description as a tap-to-call link "
+                            "(tel:). If the caller doesn't give one, the "
+                            "bridge falls back to the inbound caller-id."
+                        ),
+                    },
                     "description": {
                         "type": "string",
-                        "description": "Optional longer notes for the event body.",
+                        "description": (
+                            "Optional longer reason / notes that appear in "
+                            "the event body alongside the auto-generated "
+                            "Contact + Reference blocks."
+                        ),
                     },
                 },
                 "required": ["start_iso", "end_iso", "summary"],
