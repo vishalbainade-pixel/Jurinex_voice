@@ -6,6 +6,7 @@ import asyncio
 import html
 import json
 import time
+import uuid
 from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
@@ -97,6 +98,10 @@ class TwilioMediaStreamHandler:
         # destination, language, max_duration, etc. without re-querying.
         self.bundle: AgentBundle | None = None
         self.assembled: AssembledInstruction | None = None
+        # voice_call_schedules linkage — populated when the call originated
+        # from the scheduler poller (Twilio Stream Parameter ``schedule_id``).
+        # The teardown writes the schedule row's terminal status accordingly.
+        self.schedule_id: "uuid.UUID | None" = None
         # Per-call thresholds derived from the bundle (admin call settings),
         # falling back to .env defaults when the bundle is missing.
         self._effective_max_seconds: int = settings.max_call_duration_seconds
@@ -223,6 +228,24 @@ class TwilioMediaStreamHandler:
             f"requested={requested_agent!r} "
             f"source={'twilio_param' if custom_params.get('agent_name') else 'env'}",
         )
+
+        # ── Scheduler linkage — when this call was placed by the outbound
+        # poller, ``schedule_id`` arrives as a Stream parameter. Stash it so
+        # the teardown can mark the voice_call_schedules row complete/failed.
+        schedule_id_str = (custom_params.get("schedule_id") or "").strip()
+        if schedule_id_str:
+            try:
+                self.schedule_id = uuid.UUID(schedule_id_str)
+                log_dataflow(
+                    "scheduler.bridge.linked",
+                    f"schedule_id={self.schedule_id} call_sid={self.call_sid}",
+                )
+            except (TypeError, ValueError):
+                log_dataflow(
+                    "scheduler.bridge.bad_id",
+                    f"schedule_id={schedule_id_str!r} is not a valid UUID — ignoring",
+                    level="warning",
+                )
 
         # ── Step 2. Load the agent bundle from the admin DB, then assemble
         # the live system instruction from the active fragments + tool prompts.
@@ -1310,6 +1333,27 @@ class TwilioMediaStreamHandler:
                                 update(Call)
                                 .where(Call.id == self.session.call_db_id)
                                 .values(raw_metadata=existing)
+                            )
+
+                    # Scheduler linkage — close the originating
+                    # voice_call_schedules row. This is best-effort: a stale
+                    # schedule row never blocks teardown, but the operator
+                    # still sees a clear FAILED panel if the UPDATE itself
+                    # raises.
+                    if self.schedule_id is not None:
+                        try:
+                            from app.db.voice_call_schedules_repository import (
+                                VoiceCallSchedulesRepository,
+                            )
+
+                            await VoiceCallSchedulesRepository(session).mark_completed(
+                                schedule_id=self.schedule_id,
+                                call_id=self.session.call_db_id,
+                            )
+                        except Exception as exc:
+                            log_error(
+                                "SCHEDULER COMPLETE FAILED",
+                                f"schedule_id={self.schedule_id}: {exc}",
                             )
 
                     # Phase-3 #2 — post-call extraction. Best-effort: this

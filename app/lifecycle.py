@@ -50,7 +50,23 @@ async def lifespan(app: FastAPI):  # type: ignore[override]
     except Exception as exc:
         log_dataflow("greeting.load.error", str(exc), level="warning")
 
+    # Outbound call scheduler — only runs when SCHEDULER_ENABLED=true.
+    # The poller claims due rows from voice_call_schedules and dials Twilio.
+    try:
+        from app.services.scheduler_service import scheduler
+
+        await scheduler.start()
+    except Exception as exc:
+        log_error("SCHEDULER START FAILED", str(exc))
+
     yield
+
+    try:
+        from app.services.scheduler_service import scheduler
+
+        await scheduler.stop()
+    except Exception as exc:
+        log_dataflow("scheduler.stop_error", str(exc), level="warning")
 
     log_event_panel("APP SHUTDOWN", {"App": settings.app_name}, style="yellow", icon_key="info")
     await engine.dispose()

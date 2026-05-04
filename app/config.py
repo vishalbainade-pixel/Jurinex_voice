@@ -108,6 +108,17 @@ class Settings(BaseSettings):
     # Live session resilience — how many times we'll auto-resume the WS
     # before giving up and dropping the call.
     jurinex_voice_live_max_resumes: int = 3
+
+    # Outbound call scheduler (voice_call_schedules)
+    # Set ``scheduler_enabled=true`` to start the background poller at boot.
+    # ``scheduler_poll_seconds`` is how often the poller checks for due rows;
+    # 5–10s is the recommended production range. ``scheduler_max_inflight``
+    # caps the number of dials we dispatch per tick (prevents a flood when
+    # many rows come due at the same minute).
+    scheduler_enabled: bool = False
+    scheduler_poll_seconds: float = 5.0
+    scheduler_max_inflight: int = 4
+    scheduler_default_country_code: str = "+91"
     # Shadow-RAG (proactive context injection on every caller turn) uses a
     # LOWER threshold because the caller's raw transcript is in Hindi/Marathi
     # while docs are indexed in English — cross-language cosine is naturally

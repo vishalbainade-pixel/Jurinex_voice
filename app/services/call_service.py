@@ -135,6 +135,95 @@ class CallService:
         )
 
     # ------------------------------------------------------------------
+    # Outbound dialing for a scheduled row (voice_call_schedules)
+    # ------------------------------------------------------------------
+
+    async def place_outbound_for_schedule(
+        self,
+        *,
+        schedule_id: uuid.UUID,
+        agent_name: str,
+        to_phone: str,
+        customer_name: str | None = None,
+    ) -> str | None:
+        """Dial Twilio for one ``voice_call_schedules`` row.
+
+        The TwiML answer URL carries ``schedule_id`` + ``agent_name`` as
+        query parameters, which then end up as Twilio Stream
+        ``customParameters`` (multi-agent routing reads ``agent_name``,
+        the bridge teardown reads ``schedule_id`` to mark the schedule
+        row completed).
+
+        Returns the Twilio call SID on success, or None if Twilio
+        rejected the call. Raises only on truly unexpected errors so
+        the scheduler can route to ``mark_failed`` cleanly.
+        """
+        if settings.demo_mode and not (
+            settings.twilio_account_sid and settings.twilio_auth_token
+        ):
+            fake_sid = f"DEMO_{uuid.uuid4().hex[:24]}"
+            log_event_panel(
+                "OUTBOUND CALL (DEMO — SCHEDULER)",
+                {
+                    "Schedule id": str(schedule_id),
+                    "Agent": agent_name,
+                    "To": to_phone,
+                    "SID": fake_sid,
+                },
+                style="magenta",
+                icon_key="call_start",
+            )
+            return fake_sid
+
+        client = TwilioClient(settings.twilio_account_sid, settings.twilio_auth_token)
+        qs = urlencode(
+            {
+                "schedule_id": str(schedule_id),
+                "agent_name": agent_name,
+                "customer_name": customer_name or "",
+            }
+        )
+        answer_url = (
+            f"{settings.public_base_url.rstrip('/')}/twilio/outbound-answer?{qs}"
+        )
+        status_callback = (
+            f"{settings.public_base_url.rstrip('/')}/twilio/call-status"
+        )
+
+        try:
+            twilio_call = client.calls.create(
+                to=to_phone,
+                from_=settings.twilio_phone_number,
+                url=answer_url,
+                status_callback=status_callback,
+                status_callback_event=[
+                    "initiated", "ringing", "answered", "completed",
+                ],
+                status_callback_method="POST",
+            )
+        except TwilioRestException as exc:
+            log_error(
+                "OUTBOUND CALL FAILED (SCHEDULER)",
+                str(exc),
+                {"schedule_id": str(schedule_id), "to": to_phone},
+            )
+            raise
+
+        log_event_panel(
+            "OUTBOUND CALL PLACED (SCHEDULER)",
+            {
+                "Schedule id": str(schedule_id),
+                "Agent": agent_name,
+                "To": to_phone,
+                "SID": twilio_call.sid,
+                "Status": twilio_call.status,
+            },
+            style="cyan",
+            icon_key="call_start",
+        )
+        return twilio_call.sid
+
+    # ------------------------------------------------------------------
     # Twilio leg termination — used by end_call tool, watchdogs, etc.
     # ------------------------------------------------------------------
 

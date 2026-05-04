@@ -23,6 +23,8 @@ def _build_twiml_stream(
     direction: str,
     from_number: str | None,
     to_number: str | None,
+    schedule_id: str | None = None,
+    agent_name: str | None = None,
 ) -> str:
     """Return TwiML that connects the call to our media-stream WebSocket."""
     base = settings.public_base_url.rstrip("/")
@@ -40,6 +42,20 @@ def _build_twiml_stream(
     safe_from = xml_escape(from_number or "")
     safe_to = xml_escape(to_number or "")
     safe_sid = xml_escape(call_sid or "")
+    # Optional scheduler-side parameters. Carried as Twilio Stream
+    # <Parameter> entries so the bridge sees them in start.customParameters.
+    safe_schedule = xml_escape(schedule_id or "")
+    safe_agent = xml_escape(agent_name or "")
+    schedule_xml = (
+        f'\n      <Parameter name="schedule_id" value="{safe_schedule}"/>'
+        if schedule_id
+        else ""
+    )
+    agent_xml = (
+        f'\n      <Parameter name="agent_name" value="{safe_agent}"/>'
+        if agent_name
+        else ""
+    )
 
     # Eager greeting — three flavours, picked automatically:
     #
@@ -80,7 +96,7 @@ def _build_twiml_stream(
       <Parameter name="direction" value="{safe_direction}"/>
       <Parameter name="from" value="{safe_from}"/>
       <Parameter name="to" value="{safe_to}"/>
-      <Parameter name="call_sid" value="{safe_sid}"/>
+      <Parameter name="call_sid" value="{safe_sid}"/>{schedule_xml}{agent_xml}
     </Stream>
   </Connect>
   <Say voice="alice">Sorry, the assistant is currently unavailable. Please call back later.</Say>
@@ -122,14 +138,32 @@ async def outbound_answer(
     From: str = Form(default=""),
     To: str = Form(default=""),
 ) -> Response:
+    # Scheduler-originated dials carry ``schedule_id`` + ``agent_name`` as
+    # query-string parameters (the answer URL is built that way in
+    # CallService.place_outbound_for_schedule). Forward both into the
+    # Stream so the bridge can read them from start.customParameters.
+    schedule_id = (request.query_params.get("schedule_id") or "").strip()
+    agent_name = (request.query_params.get("agent_name") or "").strip()
+
     log_event_panel(
         "OUTBOUND ANSWERED",
-        {"From": From, "To": To, "Call SID": CallSid},
+        {
+            "From": From,
+            "To": To,
+            "Call SID": CallSid,
+            "Schedule id": schedule_id or "-",
+            "Agent": agent_name or "-",
+        },
         style="cyan",
         icon_key="call_start",
     )
     twiml = _build_twiml_stream(
-        call_sid=CallSid, direction="outbound", from_number=From, to_number=To
+        call_sid=CallSid,
+        direction="outbound",
+        from_number=From,
+        to_number=To,
+        schedule_id=schedule_id or None,
+        agent_name=agent_name or None,
     )
     log_dataflow("twilio.twiml.generated", "outbound twiml", payload={"twiml": twiml})
     return Response(content=twiml, media_type="application/xml")
