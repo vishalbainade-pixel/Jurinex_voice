@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     sync_database_url: str = (
         "postgresql+psycopg2://postgres:postgres@localhost:5432/jurinex_call_agent"
     )
+    # Voice agent DB — same Cloud SQL instance as the admin panel writes to.
+    # Falls back to ``database_url`` when blank so existing deployments keep working.
+    jurinex_voice_database_url: str = ""
 
     # Cloud SQL
     cloud_sql_connection_name: str = ""
@@ -73,6 +76,38 @@ class Settings(BaseSettings):
     kb_embedding_dim: int = 768
     kb_search_k: int = 5
     kb_min_score: float = 0.60           # below this Preeti must hand off
+
+    # Admin-side env vars (mirror what the admin panel writes & reads)
+    embedding_model: str = "gemini-embedding-001"
+    embedding_dim: int = 768
+    kb_chunk_tokens: int = 400
+    kb_chunk_overlap: int = 80
+    # Per-turn KB injection caps (used by the system_instruction builder
+    # when knowledge_base_header is rendered into the live system prompt).
+    jurinex_voice_live_kb_budget_bytes: int = 12_000
+    jurinex_voice_live_kb_chunks_per_doc: int = 3
+
+    # Cache TTLs for prompt fragments + tool prompts pulled from the admin
+    # tables. Low default (60 s) so admin edits propagate within a minute
+    # without a redeploy. Set to 0 to disable caching entirely (dev only).
+    jurinex_voice_tool_prompt_cache_ms: int = 60_000
+    jurinex_voice_prompt_fragment_cache_ms: int = 60_000
+
+    # Live session knobs (welcome wait + tool grace) — used by the realtime
+    # bridge to give the model a beat before nudging it.
+    jurinex_voice_live_welcome_timeout_ms: int = 2_000
+    jurinex_voice_live_tool_end_grace_ms: int = 2_000
+
+    # Calendar tool defaults (used by future calendar_check / calendar_book
+    # tool wiring; kept here so the SA JSON can be loaded once at startup).
+    jurinex_voice_default_calendar_id: str = ""
+    jurinex_voice_default_calendar_tz: str = "Asia/Kolkata"
+    jurinex_voice_calendar_sa_json_base64: str = ""
+    jurinex_voice_calendar_allow_attendees: bool = False
+
+    # Live session resilience — how many times we'll auto-resume the WS
+    # before giving up and dropping the call.
+    jurinex_voice_live_max_resumes: int = 3
     # Shadow-RAG (proactive context injection on every caller turn) uses a
     # LOWER threshold because the caller's raw transcript is in Hindi/Marathi
     # while docs are indexed in English — cross-language cosine is naturally

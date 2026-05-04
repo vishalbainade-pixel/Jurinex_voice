@@ -780,3 +780,10 @@ TECHNICAL_FAILURE_MESSAGE	The English line spoken when Gemini fails (no live age
 
 
 curl -X POST http://localhost:8000/admin/outbound-call   -H "Content-Type: application/json"   -H "X-Admin-API-Key: jurinex_admin_demo_key"   -d '{"to_phone_number":"+917875827092","customer_name":"Demo User","language_hint":"Hindi","reason":"Demo"}'
+
+
+
+
+.venv/bin/uvicorn app.main:app --reload 
+
+above command to run the server

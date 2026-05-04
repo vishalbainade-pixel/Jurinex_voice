@@ -45,21 +45,64 @@ class GeminiLiveClient:
         # The Twilio media-stream handler hooks this to auto-hang up the call.
         self.on_session_dead: Any = None  # Callable[[str], Awaitable | None] | None
 
+        # Effective model/voice for THIS session. Resolved at connect() time
+        # from the agent bundle (DB) or settings.* fallback.
+        self._live_model: str = settings.gemini_model
+        self._voice_name: str = settings.gemini_voice
+        self._temperature: float | None = None
+        self._enabled_tool_names: set[str] | None = None
+
+        # Auto-resume budget — bumped on every reconnect attempt; capped by
+        # ``settings.jurinex_voice_live_max_resumes``.
+        self._resume_count: int = 0
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
-    async def connect(self, session_id: str, system_prompt: str) -> None:
+    async def connect(
+        self,
+        session_id: str,
+        system_prompt: str,
+        *,
+        live_model: str | None = None,
+        voice_name: str | None = None,
+        temperature: float | None = None,
+        enabled_tool_names: set[str] | list[str] | None = None,
+    ) -> None:
+        """Open a live session.
+
+        Optional overrides (sourced from the admin DB at call start):
+
+        * ``live_model`` — Gemini Live model id (``gemini-3.1-flash-live-preview``,
+          ``gemini-2.5-flash-native-audio-preview-09-2025``, etc.). Falls back
+          to ``settings.gemini_model`` when ``None``.
+        * ``voice_name`` — prebuilt voice id (``Achernar``, ``Leda``, …).
+          Falls back to ``settings.gemini_voice``.
+        * ``temperature`` — passed through to the Live config when supported.
+        * ``enabled_tool_names`` — restrict which tool declarations get sent
+          to the model. ``None`` declares ALL of the legacy four tools. The
+          admin uses ``transfer_call`` whereas the legacy bridge declared
+          ``transfer_to_human_agent`` — both are accepted aliases here.
+        """
         self._session_id = session_id
         self._system_prompt = system_prompt
+        if live_model:
+            self._live_model = live_model
+        if voice_name:
+            self._voice_name = voice_name
+        if temperature is not None:
+            self._temperature = temperature
+        if enabled_tool_names is not None:
+            self._enabled_tool_names = set(enabled_tool_names)
 
         if not settings.gemini_key or settings.demo_mode:
             log_event_panel(
                 "GEMINI SESSION (SIMULATED)",
                 {
                     "session_id": session_id[:8],
-                    "model": settings.gemini_model,
-                    "voice": settings.gemini_voice,
+                    "model": self._live_model,
+                    "voice": self._voice_name,
                     "reason": "DEMO_MODE or missing GEMINI_API_KEY",
                 },
                 style="magenta",
@@ -94,11 +137,15 @@ class GeminiLiveClient:
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
-                        voice_name=settings.gemini_voice
+                        voice_name=self._voice_name
                     )
                 )
             ),
         )
+        # Optional generation knobs from the agent bundle. Older SDK versions
+        # may not honour `temperature` here — drop it silently if rejected.
+        if self._temperature is not None:
+            config_kwargs["temperature"] = float(self._temperature)
         try:
             config_kwargs["input_audio_transcription"] = types.AudioTranscriptionConfig()
             config_kwargs["output_audio_transcription"] = types.AudioTranscriptionConfig()
@@ -140,8 +187,13 @@ class GeminiLiveClient:
 
         # Tool declarations the model can call. Wrapped in try/except so an
         # SDK without `Tool` / `FunctionDeclaration` still opens cleanly.
+        # If the admin bundle restricted enabled tools, we filter the
+        # declarations to that subset (so the model can't call something
+        # the admin disabled).
         try:
-            config_kwargs["tools"] = _build_tool_declarations(types)
+            config_kwargs["tools"] = _build_tool_declarations(
+                types, self._enabled_tool_names
+            )
         except Exception as exc:
             log_dataflow(
                 "gemini.tools.declare_failed",
@@ -170,6 +222,7 @@ class GeminiLiveClient:
         # when an unknown kwarg is passed, while older SDKs raise TypeError.
         # We catch both.
         _OPTIONAL_KEYS = (
+            "temperature",
             "tool_config",
             "input_audio_transcription",
             "output_audio_transcription",
@@ -207,15 +260,18 @@ class GeminiLiveClient:
             tool_count += len(getattr(t, "function_declarations", []) or [])
         log_dataflow(
             "gemini.config.summary",
+            f"model={self._live_model} "
             f"modalities={config_kwargs.get('response_modalities')} "
-            f"voice={settings.gemini_voice} "
+            f"voice={self._voice_name} "
+            f"temperature={self._temperature} "
             f"input_transcription={'input_audio_transcription' in config_kwargs} "
             f"output_transcription={'output_audio_transcription' in config_kwargs} "
-            f"tools_declared={tool_count}",
+            f"tools_declared={tool_count} "
+            f"enabled={sorted(self._enabled_tool_names) if self._enabled_tool_names else 'all'}",
         )
 
         self._connect_cm = self._client.aio.live.connect(
-            model=settings.gemini_model, config=config
+            model=self._live_model, config=config
         )
         self._real_session = await self._connect_cm.__aenter__()
         self._real_mode = True
@@ -225,8 +281,8 @@ class GeminiLiveClient:
             "GEMINI SESSION STARTED",
             {
                 "session_id": session_id[:8],
-                "model": settings.gemini_model,
-                "voice": settings.gemini_voice,
+                "model": self._live_model,
+                "voice": self._voice_name,
                 "tools_declared": tool_count,
             },
             style="cyan",
@@ -234,40 +290,129 @@ class GeminiLiveClient:
         )
         await self._inbox.put(GeminiEvent(type="session_open"))
 
-    def _disable_session(self, reason: str) -> None:
-        """Mark the live session as dead — log once, drop further sends."""
-        if self._send_disabled:
-            return
-        self._send_disabled = True
-        self._send_disabled_reason = reason
+    async def _attempt_resume(self, reason: str) -> bool:
+        """Try to reconnect the Live session up to ``max_resumes`` times.
+
+        Returns True when a fresh session is open and the receive loop has
+        been restarted; False once the budget is exhausted (or no
+        system_prompt was ever recorded — meaning we never made it past the
+        initial handshake, so resuming is meaningless).
+        """
+        if self._closed or self._system_prompt is None:
+            return False
+        if self._resume_count >= settings.jurinex_voice_live_max_resumes:
+            log_dataflow(
+                "gemini.resume.exhausted",
+                f"resumes={self._resume_count} "
+                f"limit={settings.jurinex_voice_live_max_resumes} — giving up",
+                level="warning",
+            )
+            return False
+
+        self._resume_count += 1
         log_event_panel(
-            "GEMINI SESSION DEAD",
+            "GEMINI RESUME",
             {
-                "reason": reason[:200],
-                "model": settings.gemini_model,
-                "voice": settings.gemini_voice,
-                "hint": (
-                    "Common causes: (1) API key not authorized for this model; "
-                    "(2) voice name not supported by this model; "
-                    "(3) model name unavailable to the project. "
-                    "Try a stable model like gemini-2.0-flash-live-001 first."
-                ),
+                "attempt": f"{self._resume_count} of "
+                f"{settings.jurinex_voice_live_max_resumes}",
+                "trigger": reason[:200],
+                "model": self._live_model,
+                "voice": self._voice_name,
             },
-            style="red",
-            icon_key="error",
+            style="yellow",
+            icon_key="warn",
         )
 
-        # Notify owner (Twilio handler) so it can auto-hang up the call leg.
-        cb = self.on_session_dead
-        if cb is not None:
+        # Cancel the dead receive loop + close the dead context manager.
+        if self._receive_task and not self._receive_task.done():
+            self._receive_task.cancel()
+        self._receive_task = None
+        if self._connect_cm is not None:
             try:
-                result = cb(reason)
-                if asyncio.iscoroutine(result):
-                    asyncio.create_task(result)
-            except Exception as exc:
-                log_dataflow(
-                    "gemini.on_session_dead.error", str(exc), level="warning"
-                )
+                await self._connect_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+            self._connect_cm = None
+        self._real_session = None
+        self._real_mode = False
+
+        try:
+            await self._open_real_session(
+                self._session_id or "resumed", self._system_prompt
+            )
+        except Exception as exc:
+            log_dataflow(
+                "gemini.resume.failed",
+                f"attempt={self._resume_count}: {exc}",
+                level="error",
+            )
+            return False
+
+        log_dataflow(
+            "gemini.resume.ok",
+            f"attempt={self._resume_count} session re-opened",
+        )
+        return True
+
+    def _disable_session(self, reason: str) -> None:
+        """Mark the live session as dead — log once, drop further sends.
+
+        Before giving up we try ``JURINEX_VOICE_LIVE_MAX_RESUMES`` reconnects.
+        Only when those are exhausted do we set ``_send_disabled=True`` and
+        fire the ``on_session_dead`` callback to auto-hang up the call leg.
+        """
+        if self._send_disabled:
+            return
+
+        async def _try_resume_then_die() -> None:
+            ok = await self._attempt_resume(reason)
+            if ok:
+                return
+            # Resume budget exhausted — set the dead flag and notify owner.
+            self._send_disabled = True
+            self._send_disabled_reason = reason
+            log_event_panel(
+                "GEMINI SESSION DEAD",
+                {
+                    "reason": reason[:200],
+                    "model": self._live_model,
+                    "voice": self._voice_name,
+                    "resumes_tried": str(self._resume_count),
+                    "hint": (
+                        "Common causes: (1) API key not authorized for this model; "
+                        "(2) voice name not supported by this model; "
+                        "(3) model name unavailable to the project."
+                    ),
+                },
+                style="red",
+                icon_key="error",
+            )
+            cb = self.on_session_dead
+            if cb is not None:
+                try:
+                    result = cb(reason)
+                    if asyncio.iscoroutine(result):
+                        await result
+                except Exception as exc:
+                    log_dataflow(
+                        "gemini.on_session_dead.error",
+                        str(exc),
+                        level="warning",
+                    )
+
+        try:
+            asyncio.create_task(_try_resume_then_die())
+        except RuntimeError:
+            # Event loop is closed (e.g. mid-shutdown). Fall back to the
+            # legacy synchronous teardown — just notify the owner.
+            self._send_disabled = True
+            self._send_disabled_reason = reason
+            cb = self.on_session_dead
+            if cb is not None:
+                try:
+                    cb(reason)
+                except Exception:
+                    pass
 
     async def close(self) -> None:
         if self._closed:
@@ -615,13 +760,42 @@ class GeminiLiveClient:
 # ---------------------------------------------------------------------------
 
 
-def _build_tool_declarations(types: Any) -> list[Any]:
+def _build_tool_declarations(
+    types: Any,
+    enabled_tool_names: set[str] | None = None,
+) -> list[Any]:
     """Build the `tools=[Tool(function_declarations=[...])]` config block.
 
     The model needs to see the schema of every tool it's allowed to call.
     These mirror the tools wired in `app/services/tool_dispatcher.py`.
+
+    ``enabled_tool_names`` (when not ``None``) restricts the declarations to
+    that subset. The admin's table uses ``transfer_call`` while the legacy
+    bridge wired ``transfer_to_human_agent`` — both names map to the same
+    underlying declaration so the admin can use either.
     """
-    fns = [
+    # When the admin enabled "transfer_call" (their canonical name), advertise
+    # the FunctionDeclaration under THAT name so the model can find it — the
+    # admin's tool prompt template tells the model to call transfer_call(...).
+    # The dispatcher canonicalizes back to transfer_to_human_agent on the way in.
+    transfer_decl_name = (
+        "transfer_call"
+        if enabled_tool_names is not None and "transfer_call" in enabled_tool_names
+        else "transfer_to_human_agent"
+    )
+
+    # Aliases admin tables → bridge declarations.
+    _aliases = {"transfer_call": "transfer_to_human_agent"}
+    if enabled_tool_names is not None:
+        normalized: set[str] = set()
+        for name in enabled_tool_names:
+            normalized.add(_aliases.get(name, name))
+            normalized.add(name)
+        # Also accept the chosen advertised name in the filter set.
+        normalized.add(transfer_decl_name)
+        enabled_tool_names = normalized
+
+    all_fns = [
         types.FunctionDeclaration(
             name="search_knowledge_base",
             description=(
@@ -646,30 +820,47 @@ def _build_tool_declarations(types: Any) -> list[Any]:
             },
         ),
         types.FunctionDeclaration(
-            name="transfer_to_human_agent",
+            name=transfer_decl_name,
             description=(
-                "Bridge the live caller to a human Jurinex support agent. "
-                "REQUIRES EXPLICIT CALLER CONSENT — call this ONLY after "
-                "(a) the caller proactively asked for a human, OR "
-                "(b) you told them the KB doesn't have an answer and they "
-                "said yes/haan/होय when asked if they want to be connected, "
-                "OR (c) the issue is account-specific (their billing, their "
-                "case, their account). Do NOT auto-call this on a KB miss "
-                "without first asking the caller. Always speak a short "
-                "transfer line in the caller's language before calling. "
-                "Always pass `language` so Twilio's on-hold message matches."
+                "Bridge the live caller to a human agent. "
+                "REQUIRES EXPLICIT CALLER CONSENT unless the caller proactively "
+                "asked for a human. Always speak a short transfer line in the "
+                "caller's language before calling. Pass `language` so Twilio's "
+                "on-hold message matches.\n\n"
+                "DYNAMIC ROUTING: when your system prompt's "
+                "TRANSFER configuration lists multiple intent → number rules "
+                "(e.g. 'support → +91…', 'sales → +91…', 'admin → +91…'), "
+                "you MUST pass `destination_phone` set to the E.164 number "
+                "that matches the caller's intent. Pick exactly one of the "
+                "numbers listed in the rules — never invent a number. "
+                "If the rules list only one number, pass that one. "
+                "If you cannot tell which intent applies, ask the caller a "
+                "single clarifying question first; do NOT call this tool yet."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "reason": {
                         "type": "string",
-                        "description": "Short reason code (e.g. 'pricing', 'account_issue', 'kb_miss', 'caller_request').",
+                        "description": "Short reason code (e.g. 'pricing', 'account_issue', 'kb_miss', 'caller_request', 'support', 'sales', 'admin').",
                     },
                     "language": {
                         "type": "string",
                         "enum": ["English", "Hindi", "Marathi"],
                         "description": "The language the caller chose at the start of the call. Picks which on-hold message Twilio reads while the admin's phone rings.",
+                    },
+                    "destination_phone": {
+                        "type": "string",
+                        "description": (
+                            "E.164 phone number to dial. REQUIRED when the "
+                            "TRANSFER rules in your system prompt list "
+                            "multiple numbers — pick the one whose intent "
+                            "matches the caller (support / sales / admin). "
+                            "Format: '+<country><number>' with no spaces or "
+                            "dashes (e.g. '+917499303475'). Omit ONLY when "
+                            "the system prompt configures a single static "
+                            "destination."
+                        ),
                     },
                     "farewell": {
                         "type": "string",
@@ -720,5 +911,125 @@ def _build_tool_declarations(types: Any) -> list[Any]:
                 "properties": {"reason": {"type": "string"}},
             },
         ),
+        types.FunctionDeclaration(
+            name="calendar_check",
+            description=(
+                "Look up real availability on the agent's Google Calendar. "
+                "USE THIS WHEN the caller asks about open slots, availability, "
+                "'when can we meet', or before proposing any specific time. "
+                "Returns free_windows (already filtered to working hours, "
+                "excluding blocked dates and existing events). Speak the times "
+                "to the caller naturally — never read the raw ISO strings."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "start_iso": {
+                        "type": "string",
+                        "description": (
+                            "Window start in ISO 8601 with timezone offset, "
+                            "e.g. '2026-05-04T09:00:00+05:30'."
+                        ),
+                    },
+                    "end_iso": {
+                        "type": "string",
+                        "description": (
+                            "Window end in ISO 8601 with timezone offset, "
+                            "e.g. '2026-05-04T18:00:00+05:30'."
+                        ),
+                    },
+                },
+                "required": ["start_iso", "end_iso"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="agent_transfer",
+            description=(
+                "Hand the live call off to a DIFFERENT voice agent (not a "
+                "human). Use ONLY when the caller's intent clearly belongs to "
+                "another agent (e.g. switching from a sales agent to a "
+                "support agent). Speak one short hand-off line in the "
+                "caller's language BEFORE calling. Pass either "
+                "target_agent_name (the canonical voice_agents.name) or "
+                "target_agent_id (the UUID), plus a short reason."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "target_agent_name": {
+                        "type": "string",
+                        "description": "Canonical voice agent name (e.g. 'preeti', 'rohit_sales').",
+                    },
+                    "target_agent_id": {
+                        "type": "string",
+                        "description": "Voice agent UUID — used when name is ambiguous.",
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Short reason code (e.g. 'intent_changed', 'sales_query', 'billing_issue').",
+                    },
+                    "handoff_message": {
+                        "type": "string",
+                        "description": (
+                            "One sentence the new agent should read aloud "
+                            "as its first turn (provides context to the "
+                            "caller about why they're being moved)."
+                        ),
+                    },
+                    "language": {
+                        "type": "string",
+                        "enum": ["English", "Hindi", "Marathi"],
+                    },
+                },
+                "required": ["reason"],
+            },
+        ),
+        types.FunctionDeclaration(
+            name="calendar_book",
+            description=(
+                "Create a Google Calendar event after the caller has agreed "
+                "to a specific slot AND spelled out their email. Returns "
+                "status='booked' with google_event_id on success, or one of "
+                "{outside_working_hours, date_blocked, day_disabled, "
+                "view_only, conflict} on failure. Always read back the date, "
+                "time, reason, and email aloud BEFORE calling this tool."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "start_iso": {
+                        "type": "string",
+                        "description": "Start time in ISO 8601 with TZ offset.",
+                    },
+                    "end_iso": {
+                        "type": "string",
+                        "description": (
+                            "End time in ISO 8601 with TZ offset. If equal to "
+                            "start_iso the bridge fills in default_meeting_minutes."
+                        ),
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description": "Short event title (the meeting reason).",
+                    },
+                    "attendee_name": {"type": "string"},
+                    "attendee_email": {"type": "string"},
+                    "attendee_phone": {"type": "string"},
+                    "description": {
+                        "type": "string",
+                        "description": "Optional longer notes for the event body.",
+                    },
+                },
+                "required": ["start_iso", "end_iso", "summary"],
+            },
+        ),
     ]
+
+    if enabled_tool_names is None:
+        fns = all_fns
+    else:
+        fns = [fn for fn in all_fns if fn.name in enabled_tool_names]
+
+    if not fns:
+        return []
     return [types.Tool(function_declarations=fns)]

@@ -92,3 +92,27 @@ async def list_debug_events(
 ) -> list[DebugEvent]:
     events = await CallDebugEventRepository(session).list_recent(limit=limit)
     return [DebugEvent.model_validate(e) for e in events]
+
+
+@router.post("/voice/reload", status_code=status.HTTP_200_OK)
+async def reload_voice_prompts() -> dict[str, str]:
+    """Drop the in-process prompt fragment / tool template cache.
+
+    Use this after editing ``voice_system_prompt_fragments`` or
+    ``voice_tool_system_prompts`` in the admin DB so the next call picks
+    up the new template immediately, without waiting for the
+    ``JURINEX_VOICE_PROMPT_FRAGMENT_CACHE_MS`` TTL (default 60 s) to expire.
+
+    The agent bundle itself is NOT cached — every call already pulls a
+    fresh ``voice_agents`` + ``voice_agent_configurations`` join — so this
+    only needs to invalidate the fragment + tool-prompt caches.
+    """
+    from app.db.prompt_fragments_repository import PromptFragmentsRepository
+    from app.observability.logger import log_dataflow
+
+    PromptFragmentsRepository.invalidate_cache()
+    log_dataflow(
+        "admin.voice.reload",
+        "prompt fragment + tool template cache invalidated by admin",
+    )
+    return {"status": "ok", "invalidated": "prompt_fragments+tool_prompts"}

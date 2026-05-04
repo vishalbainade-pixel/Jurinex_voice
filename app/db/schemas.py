@@ -88,6 +88,50 @@ class TransferToHumanInput(BaseModel):
     reason: str = "general_support"
     farewell: str | None = None  # optional message Preeti wants spoken before transfer
     language: Literal["English", "Hindi", "Marathi"] = "English"
+    # Optional explicit destination. Used in DYNAMIC routing mode where
+    # the model is told (via the admin's destination_prompt) which number
+    # to dial based on the caller's intent. In STATIC mode this is ignored
+    # and the bundle's static_destination wins.
+    destination_phone: str | None = None
+
+
+class CalendarCheckInput(BaseModel):
+    """Inputs for ``calendar_check`` — read-only availability lookup.
+
+    ``start_iso`` / ``end_iso`` MUST be ISO 8601 with TZ offset
+    (e.g. ``2026-05-04T09:00:00+05:30``). The bridge tightens the window to
+    the agent's working hours before responding.
+    """
+
+    start_iso: str
+    end_iso: str
+
+
+class CalendarBookInput(BaseModel):
+    """Inputs for ``calendar_book`` — create a Google Calendar event."""
+
+    start_iso: str
+    end_iso: str
+    summary: str
+    attendee_name: str | None = None
+    attendee_email: str | None = None
+    attendee_phone: str | None = None
+    description: str | None = None
+
+
+class AgentTransferInput(BaseModel):
+    """Inputs for ``agent_transfer`` — switch to a different voice agent.
+
+    Either ``target_agent_name`` (preferred — matches voice_agents.name) or
+    ``target_agent_id`` (the UUID) MUST be provided. Both are accepted so
+    the model can use whichever the admin's tool prompt mentions.
+    """
+
+    target_agent_name: str | None = None
+    target_agent_id: str | None = None
+    reason: str = "intent_changed"
+    handoff_message: str | None = None  # one-line note the new agent should read aloud
+    language: Literal["English", "Hindi", "Marathi"] = "English"
 
 
 # ---------------------------------------------------------------------------
